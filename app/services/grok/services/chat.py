@@ -32,6 +32,7 @@ from app.services.grok.utils.tool_call import (
     parse_tool_call_block,
     format_tool_history,
 )
+from app.services.grok.utils.usage import estimate_chat_usage, estimate_prompt_tokens
 from app.services.token import get_token_manager, EffortType
 
 
@@ -262,6 +263,7 @@ class GrokChatService:
         file_attachments: List[str] = None,
         tool_overrides: Dict[str, Any] = None,
         model_config_override: Dict[str, Any] = None,
+        request_overrides: Dict[str, Any] = None,
     ):
         """发送聊天请求"""
         if stream is None:
@@ -285,6 +287,7 @@ class GrokChatService:
                 file_attachments=file_attachments,
                 tool_overrides=tool_overrides,
                 model_config_override=model_config_override,
+                request_overrides=request_overrides,
             )
             logger.info(f"Chat connected: model={model}, stream={stream}")
         except Exception:
@@ -373,7 +376,8 @@ class GrokChatService:
             model_config_override=model_config_override,
         )
 
-        return response, stream, model
+        prompt_tokens = estimate_prompt_tokens(message)
+        return response, stream, model, prompt_tokens
 
 
 class ChatService:
@@ -426,7 +430,7 @@ class ChatService:
             try:
                 # 请求 Grok
                 service = GrokChatService()
-                response, _, model_name = await service.chat_openai(
+                response, _, model_name, prompt_tokens = await service.chat_openai(
                     token,
                     model,
                     messages,
@@ -442,14 +446,27 @@ class ChatService:
                 # 处理响应
                 if is_stream:
                     logger.debug(f"Processing stream response: model={model}")
-                    processor = StreamProcessor(model_name, token, show_think, tools=tools, tool_choice=tool_choice)
+                    processor = StreamProcessor(
+                        model_name,
+                        token,
+                        show_think,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        prompt_tokens=prompt_tokens,
+                    )
                     return wrap_stream_with_usage(
                         processor.process(response), token_mgr, token, model
                     )
 
                 # 非流式
                 logger.debug(f"Processing non-stream response: model={model}")
-                result = await CollectProcessor(model_name, token, tools=tools, tool_choice=tool_choice).process(response)
+                result = await CollectProcessor(
+                    model_name,
+                    token,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    prompt_tokens=prompt_tokens,
+                ).process(response)
                 try:
                     model_info = ModelService.get(model)
                     effort = (
@@ -506,14 +523,22 @@ class ChatService:
 class StreamProcessor(proc_base.BaseProcessor):
     """Stream response processor."""
 
-    def __init__(self, model: str, token: str = "", show_think: bool = None, tools: List[Dict[str, Any]] = None, tool_choice: Any = None):
+    def __init__(
+        self,
+        model: str,
+        token: str = "",
+        show_think: bool = None,
+        tools: List[Dict[str, Any]] = None,
+        tool_choice: Any = None,
+        prompt_tokens: int = 0,
+    ):
         super().__init__(model, token)
         self.response_id: str = None
         self.fingerprint: str = ""
         self.rollout_id: str = ""
         self.think_opened: bool = False
-        self.think_closed_once: bool = False
         self.image_think_active: bool = False
+        self._content_started: bool = False
         self.role_sent: bool = False
         self.filter_tags = get_config("app.filter_tags")
         self.tool_usage_enabled = (
@@ -531,6 +556,17 @@ class StreamProcessor(proc_base.BaseProcessor):
         self._tool_partial = ""
         self._tool_calls_seen = False
         self._tool_call_index = 0
+        self.prompt_tokens = max(0, int(prompt_tokens or 0))
+        self._completion_parts: list[str] = []
+        self._completion_tool_calls: list[dict[str, Any]] = []
+
+    def _record_content(self, content: str) -> None:
+        if content:
+            self._completion_parts.append(content)
+
+    def _record_tool_call(self, tool_call: Any) -> None:
+        if isinstance(tool_call, dict):
+            self._completion_tool_calls.append(tool_call)
 
     def _with_tool_index(self, tool_call: Any) -> Any:
         if not isinstance(tool_call, dict):
@@ -691,7 +727,14 @@ class StreamProcessor(proc_base.BaseProcessor):
         self._tool_state = "text"
         return events
 
-    def _sse(self, content: str = "", role: str = None, finish: str = None, tool_calls: list = None) -> str:
+    def _sse(
+        self,
+        content: str = "",
+        role: str = None,
+        finish: str = None,
+        tool_calls: list = None,
+        usage: dict | None = None,
+    ) -> str:
         """Build SSE response."""
         delta = {}
         if role:
@@ -712,6 +755,8 @@ class StreamProcessor(proc_base.BaseProcessor):
                 {"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}
             ],
         }
+        if usage is not None:
+            chunk["usage"] = usage
         return f"data: {orjson.dumps(chunk).decode()}\n\n"
 
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
@@ -771,7 +816,6 @@ class StreamProcessor(proc_base.BaseProcessor):
                     if self.image_think_active and self.think_opened:
                         yield self._sse("\n</think>\n")
                         self.think_opened = False
-                        self.think_closed_once = True
                     self.image_think_active = False
                     for url in proc_base._collect_images(mr):
                         parts = url.split("/")
@@ -780,6 +824,7 @@ class StreamProcessor(proc_base.BaseProcessor):
                         rendered = await dl_service.render_image(
                             url, self.token, img_id
                         )
+                        self._record_content(f"{rendered}\n")
                         yield self._sse(f"{rendered}\n")
 
                     if (
@@ -804,23 +849,36 @@ class StreamProcessor(proc_base.BaseProcessor):
                             if original:
                                 title_safe = title.replace("\n", " ").strip()
                                 if title_safe:
+                                    self._record_content(f"![{title_safe}]({original})\n")
                                     yield self._sse(f"![{title_safe}]({original})\n")
                                 else:
+                                    self._record_content(f"![image]({original})\n")
                                     yield self._sse(f"![image]({original})\n")
                     continue
 
                 if (token := resp.get("token")) is not None:
                     if not token:
                         continue
-                    if is_thinking and self.think_closed_once and not self.image_think_active:
-                        continue
                     filtered = self._filter_token(token)
                     if not filtered:
                         continue
+                    # 判断是否在 Agent 思考/处理阶段：
+                    #   - isThinking=true → 归入 think
+                    #   - 有 messageStepId → Agent 处理中，归入 think
+                    #   - image_think_active → 图片生成中
+                    #   正式内容开始后，丢弃中途插入的思考（Grok 官网也隐藏了这部分）
+                    has_step_id = bool(resp.get("messageStepId"))
                     in_think = (
-                        (is_thinking and not self.think_closed_once)
+                        is_thinking
+                        or has_step_id
                         or self.image_think_active
                     )
+                    # 正式内容已开始后，丢弃中途插入的 Agent 思考（1-2 句内部注释，无用户价值）
+                    if self._content_started and in_think and not self.image_think_active:
+                        continue
+                    # 空 token 不关闭 think 块（搜索结果间的空 token 不算正式内容）
+                    if not in_think and not filtered.strip():
+                        continue
                     if in_think:
                         if not self.show_think:
                             continue
@@ -831,36 +889,55 @@ class StreamProcessor(proc_base.BaseProcessor):
                         if self.think_opened:
                             yield self._sse("\n</think>\n")
                             self.think_opened = False
-                            self.think_closed_once = True
+                            self._content_started = True
 
                     if in_think:
+                        self._record_content(filtered)
                         yield self._sse(filtered)
                         continue
 
                     if self._tool_stream_enabled:
                         for kind, payload in self._handle_tool_stream(filtered):
                             if kind == "text":
+                                self._record_content(payload)
                                 yield self._sse(payload)
                             elif kind == "tool":
+                                self._record_tool_call(payload)
                                 yield self._sse(tool_calls=[payload])
                         continue
 
+                    self._record_content(filtered)
                     yield self._sse(filtered)
 
             if self.think_opened:
                 yield self._sse("</think>\n")
-                self.think_closed_once = True
 
             if self._tool_stream_enabled:
                 for kind, payload in self._flush_tool_stream():
                     if kind == "text":
+                        self._record_content(payload)
                         yield self._sse(payload)
                     elif kind == "tool":
+                        self._record_tool_call(payload)
                         yield self._sse(tool_calls=[payload])
                 finish_reason = "tool_calls" if self._tool_calls_seen else "stop"
-                yield self._sse(finish=finish_reason)
+                yield self._sse(
+                    finish=finish_reason,
+                    usage=estimate_chat_usage(
+                        prompt_tokens=self.prompt_tokens,
+                        content="".join(self._completion_parts),
+                        tool_calls=self._completion_tool_calls or None,
+                    ),
+                )
             else:
-                yield self._sse(finish="stop")
+                yield self._sse(
+                    finish="stop",
+                    usage=estimate_chat_usage(
+                        prompt_tokens=self.prompt_tokens,
+                        content="".join(self._completion_parts),
+                        tool_calls=self._completion_tool_calls or None,
+                    ),
+                )
 
             yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
@@ -902,11 +979,19 @@ class StreamProcessor(proc_base.BaseProcessor):
 class CollectProcessor(proc_base.BaseProcessor):
     """Non-stream response processor."""
 
-    def __init__(self, model: str, token: str = "", tools: List[Dict[str, Any]] = None, tool_choice: Any = None):
+    def __init__(
+        self,
+        model: str,
+        token: str = "",
+        tools: List[Dict[str, Any]] = None,
+        tool_choice: Any = None,
+        prompt_tokens: int = 0,
+    ):
         super().__init__(model, token)
         self.filter_tags = get_config("app.filter_tags")
         self.tools = tools
         self.tool_choice = tool_choice
+        self.prompt_tokens = max(0, int(prompt_tokens or 0))
 
     def _filter_content(self, content: str) -> str:
         """Filter special tags in content."""
@@ -946,6 +1031,8 @@ class CollectProcessor(proc_base.BaseProcessor):
         response_id = ""
         fingerprint = ""
         content = ""
+        # 兜底收集非 thinking 且无 messageStepId 的最终内容 token
+        fallback_tokens: list[str] = []
         idle_timeout = get_config("chat.stream_timeout")
 
         try:
@@ -964,6 +1051,13 @@ class CollectProcessor(proc_base.BaseProcessor):
 
                 if (llm := resp.get("llmInfo")) and not fingerprint:
                     fingerprint = llm.get("modelHash", "")
+
+                # 收集非 thinking 且无 messageStepId 的 token（最终内容兜底）
+                is_thinking = bool(resp.get("isThinking"))
+                has_step_id = bool(resp.get("messageStepId"))
+                if not is_thinking and not has_step_id:
+                    if tok := resp.get("token"):
+                        fallback_tokens.append(tok)
 
                 if mr := resp.get("modelResponse"):
                     response_id = mr.get("responseId", "")
@@ -1064,6 +1158,10 @@ class CollectProcessor(proc_base.BaseProcessor):
         finally:
             await self.close()
 
+        # modelResponse.message 为空时（多智能体模型），用兜底 token 拼接
+        if not content and fallback_tokens:
+            content = "".join(fallback_tokens)
+
         content = self._filter_content(content)
 
         # Parse for tool calls if tools were provided
@@ -1098,22 +1196,11 @@ class CollectProcessor(proc_base.BaseProcessor):
                     "finish_reason": finish_reason,
                 }
             ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "prompt_tokens_details": {
-                    "cached_tokens": 0,
-                    "text_tokens": 0,
-                    "audio_tokens": 0,
-                    "image_tokens": 0,
-                },
-                "completion_tokens_details": {
-                    "text_tokens": 0,
-                    "audio_tokens": 0,
-                    "reasoning_tokens": 0,
-                },
-            },
+            "usage": estimate_chat_usage(
+                prompt_tokens=self.prompt_tokens,
+                content=content,
+                tool_calls=tool_calls_result,
+            ),
         }
 
 

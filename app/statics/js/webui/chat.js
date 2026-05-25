@@ -2,7 +2,7 @@
   const VERIFY_ENDPOINT = '/webui/api/verify';
   const MODELS_ENDPOINT = '/webui/api/models';
   const CHAT_ENDPOINT = '/webui/api/chat/completions';
-  const PREFERRED_MODEL = 'grok-4.20-0309';
+  const PREFERRED_MODEL = 'grok-4.20-0309-non-reasoning';
   const STORE_KEY = 'grok2api_webui_chat_sessions_v1';
   const SIDEBAR_STORE_KEY = 'grok2api_webui_sidebar_collapsed_v1';
 
@@ -243,13 +243,51 @@
     return html.join('') || '<p></p>';
   }
 
+  function _extractMath(source) {
+    const placeholders = [];
+    // Display math: $$...$$ (must come before inline to avoid double-match)
+    let out = source.replace(/\$\$([\s\S]+?)\$\$/g, (_, tex) => {
+      const i = placeholders.length;
+      placeholders.push({ tex, display: true });
+      return `\x02MATH${i}\x03`;
+    });
+    // Inline math: $...$  (single-line only, no space at edges to avoid false positives)
+    out = out.replace(/\$([^\n$]+?)\$/g, (_, tex) => {
+      const i = placeholders.length;
+      placeholders.push({ tex, display: false });
+      return `\x02MATH${i}\x03`;
+    });
+    return { out, placeholders };
+  }
+
   function renderRichMarkdown(source) {
     if (window.marked && typeof window.marked.parse === 'function') {
-      const rendered = window.marked.parse(normalizeMediaContent(source), {
+      let toRender = normalizeMediaContent(source);
+      let placeholders = [];
+
+      if (window.katex) {
+        const extracted = _extractMath(toRender);
+        toRender = extracted.out;
+        placeholders = extracted.placeholders;
+      }
+
+      let rendered = window.marked.parse(toRender, {
         async: false,
         breaks: true,
         gfm: true,
       });
+
+      if (window.katex && placeholders.length) {
+        rendered = rendered.replace(/\x02MATH(\d+)\x03/g, (_, idx) => {
+          const { tex, display } = placeholders[parseInt(idx, 10)];
+          try {
+            return window.katex.renderToString(tex, { displayMode: display, throwOnError: false });
+          } catch (_e) {
+            return escapeHtml(display ? `$$${tex}$$` : `$${tex}$`);
+          }
+        });
+      }
+
       return sanitizeRenderedHtml(rendered);
     }
     return renderMarkdown(source);
@@ -275,6 +313,64 @@
       if (isImageUrl(url)) return `![image](${url})`;
       if (isVideoUrl(url)) return `<video controls preload="metadata" src="${escapeHtml(url)}"></video>`;
       return match;
+    });
+  }
+
+  function isNativeGrokMediaUrl(value) {
+    try {
+      const url = new URL(value, window.location.origin);
+      return /(^|\.)grok\.com$/i.test(url.hostname);
+    } catch {
+      return false;
+    }
+  }
+
+  function showMediaProxyHint(media, type) {
+    if (!media || media.nextElementSibling?.classList?.contains('msg-media-error')) return;
+    const hint = document.createElement('div');
+    hint.className = 'msg-media-error';
+    if (type === 'image') {
+      hint.textContent = text(
+        'webui.chat.errors.imageProxyRequired',
+        'Image failed to load. Set APP Base URL and change image output format to local_url, local_md, or base64.'
+      );
+    } else {
+      hint.textContent = text(
+        'webui.chat.errors.videoProxyRequired',
+        'Video loading returned 403. Go to the admin page, set the APP Base URL, then change the video output format to local proxy mode (local_url or local_html) and retry.'
+      );
+    }
+    media.insertAdjacentElement('afterend', hint);
+  }
+
+  function clearMediaProxyHint(media) {
+    const hint = media && media.nextElementSibling;
+    if (hint?.classList?.contains('msg-media-error')) hint.remove();
+  }
+
+  function enhanceMediaElements(card) {
+    card.querySelectorAll('video').forEach((video) => {
+      if (video.dataset.proxyHintBound === '1') return;
+      video.dataset.proxyHintBound = '1';
+      const onVideoError = () => showMediaProxyHint(video, 'video');
+      video.addEventListener('error', onVideoError);
+      video.querySelectorAll('source').forEach((source) => {
+        source.addEventListener('error', onVideoError);
+      });
+      video.addEventListener('loadedmetadata', () => clearMediaProxyHint(video));
+      if (video.error) showMediaProxyHint(video, 'video');
+    });
+
+    card.querySelectorAll('img').forEach((img) => {
+      if (img.dataset.proxyHintBound === '1') return;
+      img.dataset.proxyHintBound = '1';
+      img.addEventListener('error', () => {
+        if (isNativeGrokMediaUrl(img.currentSrc || img.src)) showMediaProxyHint(img, 'image');
+      });
+      img.addEventListener('load', () => clearMediaProxyHint(img));
+      if (img.complete && img.naturalWidth === 0 && isNativeGrokMediaUrl(img.currentSrc || img.src)) {
+        showMediaProxyHint(img, 'image');
+      }
     });
   }
 
@@ -423,6 +519,7 @@
           )).join(''));
         }
         card.innerHTML = parts.join('') || '<p></p>';
+        enhanceMediaElements(card);
         return;
       }
 
@@ -463,6 +560,7 @@
 
     if (role === 'assistant') {
       card.innerHTML = renderRichMarkdown(content);
+      enhanceMediaElements(card);
       return;
     }
     card.textContent = content;
